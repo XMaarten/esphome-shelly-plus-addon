@@ -41,7 +41,7 @@ void ShellyDallasComponent::setup() {
 }
 
 void ShellyDallasComponent::dump_config() {
-  ESP_LOGCONFIG(TAG, "Shelly Dallas:");
+  ESP_LOGCONFIG(TAG, "Shelly Dallas: CRC timing test v1");
   ESP_LOGCONFIG(TAG, "  TX Pin: GPIO%d", pin_tx_->get_pin());
   ESP_LOGCONFIG(TAG, "  RX Pin: GPIO%d", pin_rx_->get_pin());
   ESP_LOGCONFIG(TAG, "  Found %d sensor(s)", found_sensors_.size());
@@ -61,9 +61,9 @@ void ShellyDallasComponent::update() {
   // Start temperature conversion on all sensors
   if (!reset_()) {
     ESP_LOGW(TAG, "No devices found on 1-Wire bus during update");
-    // Still call read_temperature so sensors can use their error tolerance
+    // No conversion started: do not accept old scratchpad data as fresh.
     for (auto *sensor : sensors_) {
-      sensor->read_temperature();
+      sensor->handle_read_error_("Conversion reset failed");
     }
     return;
   }
@@ -93,6 +93,7 @@ bool HOT IRAM_ATTR ShellyDallasComponent::reset_() {
   } while (!pin_rx_->digital_read());
 
   // Send 480µs LOW reset pulse
+  InterruptLock lock;
   pin_tx_->digital_write(false);
   delayMicroseconds(480);
   pin_tx_->digital_write(true);
@@ -110,6 +111,7 @@ bool HOT IRAM_ATTR ShellyDallasComponent::reset_() {
 }
 
 void HOT IRAM_ATTR ShellyDallasComponent::write_bit_(bool bit) {
+  InterruptLock lock;
   // Pull low
   pin_tx_->digital_write(false);
 
@@ -127,11 +129,11 @@ void HOT IRAM_ATTR ShellyDallasComponent::write_bit_(bool bit) {
 }
 
 bool HOT IRAM_ATTR ShellyDallasComponent::read_bit_() {
+  InterruptLock lock;
+  // Start before the falling edge; keep the slot uninterrupted.
+  uint32_t start = micros();
   // Initiate read by pulling low
   pin_tx_->digital_write(false);
-
-  // Record start time for precise timing
-  uint32_t start = micros();
 
   // Hold low for 3µs
   delayMicroseconds(3);
@@ -147,10 +149,10 @@ bool HOT IRAM_ATTR ShellyDallasComponent::read_bit_() {
   // Sample the bus
   bool r = pin_rx_->digital_read();
 
-  // Ensure we complete the 60µs time slot
+  // Include recovery margin before the next slot.
   uint32_t now = micros();
-  if (now - start < 60)
-    delayMicroseconds(60 - (now - start));
+  if (now - start < 65)
+    delayMicroseconds(65 - (now - start));
 
   return r;
 }
@@ -301,7 +303,10 @@ bool ShellyDallasTemperatureSensor::setup_sensor() {
 }
 
 void ShellyDallasTemperatureSensor::handle_read_error_(const char *reason) {
-  consecutive_errors_++;
+  if (consecutive_errors_ < 255)
+    consecutive_errors_++;
+  ESP_LOGW(TAG, "Sensor '%s', address 0x%016llX", this->get_name().c_str(),
+           (unsigned long long) address_);
 
   if (consecutive_errors_ >= max_consecutive_errors_ || std::isnan(last_valid_value_)) {
     // Too many errors or no valid value yet - publish NAN
@@ -347,7 +352,19 @@ bool ShellyDallasTemperatureSensor::read_temperature() {
   }
 
   if (crc != 0) {
+    ESP_LOGW(TAG, "Scratchpad: %02X %02X %02X %02X %02X %02X %02X %02X %02X; CRC residue=%02X",
+             scratchpad[0], scratchpad[1], scratchpad[2], scratchpad[3], scratchpad[4],
+             scratchpad[5], scratchpad[6], scratchpad[7], scratchpad[8], crc);
     handle_read_error_("CRC error reading scratchpad");
+    return false;
+  }
+
+  // A stuck-low bus produces nine zeros, which also pass CRC.
+  bool all_zero = true;
+  for (uint8_t byte : scratchpad)
+    all_zero &= byte == 0;
+  if (all_zero) {
+    handle_read_error_("All-zero scratchpad");
     return false;
   }
 

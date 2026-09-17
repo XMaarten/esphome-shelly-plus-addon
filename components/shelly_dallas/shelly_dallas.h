@@ -53,6 +53,7 @@ class ShellyDallasComponent : public PollingComponent {
 };
 
 class ShellyDallasTemperatureSensor : public sensor::Sensor {
+  friend class ShellyDallasComponent;
  public:
   void set_parent(ShellyDallasComponent *parent) { parent_ = parent; }
   void set_address(uint64_t address) { address_ = address; }
