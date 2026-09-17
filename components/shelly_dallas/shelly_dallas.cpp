@@ -41,7 +41,7 @@ void ShellyDallasComponent::setup() {
 }
 
 void ShellyDallasComponent::dump_config() {
-  ESP_LOGCONFIG(TAG, "Shelly Dallas: CRC timing test v1");
+  ESP_LOGCONFIG(TAG, "Shelly Dallas: CRC timing test v2 (staggered reads)");
   ESP_LOGCONFIG(TAG, "  TX Pin: GPIO%d", pin_tx_->get_pin());
   ESP_LOGCONFIG(TAG, "  RX Pin: GPIO%d", pin_rx_->get_pin());
   ESP_LOGCONFIG(TAG, "  Found %d sensor(s)", found_sensors_.size());
@@ -58,6 +58,10 @@ void ShellyDallasComponent::dump_config() {
 }
 
 void ShellyDallasComponent::update() {
+  // Do not overlap conversion and read cycles.
+  if (read_cycle_active_ || sensors_.empty())
+    return;
+
   // Start temperature conversion on all sensors
   if (!reset_()) {
     ESP_LOGW(TAG, "No devices found on 1-Wire bus during update");
@@ -73,11 +77,25 @@ void ShellyDallasComponent::update() {
 
   // Wait for conversion (750ms for 12-bit resolution)
   // Use set_timeout to avoid blocking
-  this->set_timeout("convert", 750, [this]() {
-    for (auto *sensor : sensors_) {
-      sensor->read_temperature();
-    }
-  });
+  read_cycle_active_ = true;
+  this->set_timeout("convert", 750, [this]() { this->read_next_sensor_(0); });
+}
+
+void ShellyDallasComponent::read_next_sensor_(size_t index) {
+  if (index >= sensors_.size()) {
+    read_cycle_active_ = false;
+    return;
+  }
+
+  // One transaction per callback. Continue even after a CRC failure.
+  sensors_[index]->read_temperature();
+  if (index + 1 >= sensors_.size()) {
+    read_cycle_active_ = false;
+    return;
+  }
+
+  // Yield to the main loop instead of blocking with delay().
+  this->set_timeout("read_next", 5, [this, index]() { this->read_next_sensor_(index + 1); });
 }
 
 bool HOT IRAM_ATTR ShellyDallasComponent::reset_() {

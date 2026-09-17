@@ -42,6 +42,8 @@ class ShellyDallasComponent : public PollingComponent {
   void write_byte_(uint8_t data);
   uint8_t read_byte_();
   void select_(uint64_t address);
+  void read_next_sensor_(size_t index);
+  bool read_cycle_active_{false};
 
   // Search ROM
   void search_();
